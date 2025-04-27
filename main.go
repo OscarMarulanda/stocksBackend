@@ -38,7 +38,7 @@ func main() {
 		AllowedHeaders: []string{"Content-Type", "Authorization"}, // Allowed headers
 	})
 
-	err := godotenv.Load()
+	err := godotenv.Load("../.env")
 	if err != nil {
 		log.Println("Warning: No .env file found (using system env vars)")
 	}
