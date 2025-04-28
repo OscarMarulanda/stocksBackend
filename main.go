@@ -34,9 +34,11 @@ type TimeSeriesResponse struct {
 func main() {
 
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"http://localhost:5173", "http://stocks-bucket-d989cba0.s3-website.us-east-2.amazonaws.com"}, // Allow only your frontend URL
-		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE"}, // Allowed HTTP methods
-		AllowedHeaders: []string{"Content-Type", "Authorization"}, // Allowed headers
+		AllowedOrigins: []string{"*"}, // For development, you can use "*" but restrict in production
+		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{"*"},
+		AllowCredentials: true,
+		Debug: true, // Enable this to see CORS logs
 	})
 
 	err := godotenv.Load("./.env")
@@ -94,8 +96,11 @@ func initDB(db *sql.DB) {
 
 func getStockDataHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 		// Log incoming request
-		log.Println("🔍 Incoming GET request:", r.URL.Path)
+		log.Printf("🔍 Incoming GET request: %s %s", r.Method, r.URL.Path)
+		log.Printf("Headers: %v", r.Header)
 
 		vars := mux.Vars(r)
 		symbol := vars["symbol"]
