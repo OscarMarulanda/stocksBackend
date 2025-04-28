@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -33,12 +34,12 @@ type TimeSeriesResponse struct {
 func main() {
 
 	c := cors.New(cors.Options{
-		AllowedOrigins: []string{"http://localhost:5173"}, // Allow only your frontend URL
+		AllowedOrigins: []string{"http://localhost:5173", "http://stocks-bucket-d989cba0.s3-website.us-east-2.amazonaws.com"}, // Allow only your frontend URL
 		AllowedMethods: []string{"GET", "POST", "PUT", "DELETE"}, // Allowed HTTP methods
 		AllowedHeaders: []string{"Content-Type", "Authorization"}, // Allowed headers
 	})
 
-	err := godotenv.Load("../.env")
+	err := godotenv.Load("./.env")
 	if err != nil {
 		log.Println("Warning: No .env file found (using system env vars)")
 	}
@@ -114,6 +115,24 @@ func getStockDataHandler(db *sql.DB) http.HandlerFunc {
 			log.Println("❌ Error: Range parameter is required")
 			return
 		}
+
+		var count int
+        err := db.QueryRow("SELECT COUNT(*) FROM stock_data WHERE symbol = $1", symbol).Scan(&count)
+        if err != nil {
+            http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
+            log.Println("❌ Error: Database query failed", err)
+            return
+        }
+
+        // If no data exists, fetch from API
+        if count == 0 {
+            _, err := fetchAndStoreData(db, symbol)
+    		if err != nil {
+        		http.Error(w, "Failed to fetch initial data", http.StatusInternalServerError)
+        		return
+    		}
+		}
+        
 
 		var query string
 		var args []interface{}
@@ -193,71 +212,118 @@ func getStockDataHandler(db *sql.DB) http.HandlerFunc {
 
 
 func refreshStockDataHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		apiKey := os.Getenv("ALPHA_VANTAGE_API_KEY")
-		if apiKey == "" {
-			http.Error(w, "Missing API key configuration", http.StatusInternalServerError)
-			return
-		}
+    return func(w http.ResponseWriter, r *http.Request) {
+        vars := mux.Vars(r)
+        symbol := vars["symbol"]
+        
+        newRecords, err := fetchAndStoreData(db, symbol)
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        
+        json.NewEncoder(w).Encode(map[string]interface{}{
+            "message":    "Stock data refreshed",
+            "newRecords": newRecords,
+        })
+    }
+}
 
-		vars := mux.Vars(r)
-		symbol := vars["symbol"]
-		baseURL := "https://www.alphavantage.co/query"
+func fetchAndStoreData(db *sql.DB, symbol string) (int, error) {
+    apiKey := os.Getenv("ALPHA_VANTAGE_API_KEY")
+    if apiKey == "" {
+        return 0, fmt.Errorf("missing API key configuration")
+    }
 
-		client := resty.New()
-		data, err := fetchStockData(client, baseURL, apiKey, symbol, "compact")
-		if err != nil {
-			http.Error(w, "Failed to fetch stock data: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
+    baseURL := "https://www.alphavantage.co/query"
+    
+    // Fetch data from Alpha Vantage
+    data, err := fetchStockData(resty.New(), baseURL, apiKey, symbol, "compact")
+    if err != nil {
+        return 0, fmt.Errorf("failed to fetch stock data: %w", err)
+    }
 
-		// Get the latest date we already have in the database
-		var latestDate sql.NullString
-		err = db.QueryRow("SELECT MAX(date) FROM stock_data WHERE symbol = $1", symbol).Scan(&latestDate)
-		if err != nil {
-			log.Printf("Warning: Couldn't determine latest date in database: %v", err)
-		}
+    // Get the latest date we already have in DB
+    var latestDate sql.NullString
+    err = db.QueryRow("SELECT MAX(date) FROM stock_data WHERE symbol = $1", symbol).Scan(&latestDate)
+    if err != nil {
+        return 0, fmt.Errorf("failed to query latest date: %w", err)
+    }
 
-		// Prepare the insert statement
-		stmt, err := db.Prepare(`
-			INSERT INTO stock_data (date, symbol, open, high, low, close, volume)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (date, symbol) DO NOTHING
-		`)
-		if err != nil {
-			http.Error(w, "Database error: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer stmt.Close()
+    // Prepare the insert statement
+    stmt, err := db.Prepare(`
+        INSERT INTO stock_data (date, symbol, open, high, low, close, volume)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (date, symbol) DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            last_updated = now()
+    `)
+    if err != nil {
+        return 0, fmt.Errorf("failed to prepare statement: %w", err)
+    }
+    defer stmt.Close()
 
-		newRecords := 0
-		for dateStr, stockData := range data.TimeSeriesDaily {
-			// Skip if we already have data for this date
-			if latestDate.Valid && dateStr <= latestDate.String {
-				continue
-			}
+    newRecords := 0
+    for dateStr, stockData := range data.TimeSeriesDaily {
+        // Skip if we already have this data (unless we want to force update)
+        if latestDate.Valid && dateStr <= latestDate.String {
+            continue
+        }
 
-			_, err = stmt.Exec(
-				dateStr, symbol, stockData.Open, stockData.High, 
-				stockData.Low, stockData.Close, stockData.Volume,
-			)
+        // Convert string values to appropriate types
+        open, err := strconv.ParseFloat(stockData.Open, 64)
+        if err != nil {
+            log.Printf("Failed to parse open price for %s: %v", dateStr, err)
+            continue
+        }
 
-			if err != nil {
-				log.Printf("Failed to insert data for %s: %v", dateStr, err)
-			} else {
-				newRecords++
-			}
-		}
+        high, err := strconv.ParseFloat(stockData.High, 64)
+        if err != nil {
+            log.Printf("Failed to parse high price for %s: %v", dateStr, err)
+            continue
+        }
 
-		response := map[string]interface{}{
-			"message":    "Stock data refreshed",
-			"newRecords": newRecords,
-			"symbol":     symbol,
-		}
+        low, err := strconv.ParseFloat(stockData.Low, 64)
+        if err != nil {
+            log.Printf("Failed to parse low price for %s: %v", dateStr, err)
+            continue
+        }
 
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	}
+        closeVal, err := strconv.ParseFloat(stockData.Close, 64)
+        if err != nil {
+            log.Printf("Failed to parse close price for %s: %v", dateStr, err)
+            continue
+        }
+
+        volume, err := strconv.Atoi(stockData.Volume)
+        if err != nil {
+            log.Printf("Failed to parse volume for %s: %v", dateStr, err)
+            continue
+        }
+
+        // Execute the insert
+        _, err = stmt.Exec(
+            dateStr,
+            symbol,
+            open,
+            high,
+            low,
+            closeVal,
+            volume,
+        )
+        if err != nil {
+            log.Printf("Failed to insert data for %s: %v", dateStr, err)
+            continue
+        }
+
+        newRecords++
+    }
+
+    return newRecords, nil
 }
 
 
